@@ -215,7 +215,8 @@ class Zonos(nn.Module):
 
     def can_use_cudagraphs(self) -> bool:
         # Only the mamba-ssm backbone supports CUDA Graphs at the moment
-        return self.device.type == "cuda" and "_mamba_ssm" in str(self.backbone.__class__)
+        # return self.device.type == "cuda" and "_mamba_ssm" in str(self.backbone.__class__)
+        return False
 
     @torch.inference_mode()
     def generate(
@@ -453,29 +454,46 @@ class Zonos(nn.Module):
         self._cg_graph = None  # reset cuda graph
         return
 
-
     @torch.inference_mode()
     def stream(
         self,
-        prefix_conditioning: torch.Tensor,      
-        audio_prefix_codes: torch.Tensor | None = None,  
+        prefix_conditioning: torch.Tensor,  # conditioning from text (and other modalities)
+        audio_prefix_codes: torch.Tensor | None = None,  # optional audio prefix codes
         max_new_tokens: int = 86 * 30,
         cfg_scale: float = 2.0,
-        batch_size: int = 1,
         sampling_params: dict = dict(min_p=0.1),
         disable_torch_compile: bool = False,
-        chunk_size: int = 10,   # yield a new audio chunk every chunk_size tokens
-    ) -> Generator[tuple[int, np.ndarray], None, None]:
+        chunk_schedule: list[int] = [20, 20, 40, 60, 80],
+        chunk_overlap: int = 2,
+    ) -> Generator[torch.Tensor, None, None]:
+        """
+        Stream audio generation in chunks with smooth transitions between chunks.
+
+        Args:
+            prefix_conditioning: Conditioning tensor from text and other modalities
+            audio_prefix_codes: Optional audio prefix codes
+            max_new_tokens: Maximum number of new tokens to generate
+            cfg_scale: Classifier-free guidance scale
+            sampling_params: Parameters for sampling from logits
+            disable_torch_compile: Whether to disable torch.compile
+            chunk_schedule: List of chunk sizes to use in sequence (will use the last size for remaining chunks)
+            chunk_overlap: Number of tokens to overlap between chunks (also determines audio crossfade size)
+
+        Yields:
+            Audio chunks as torch tensors
+        """
         assert cfg_scale != 1, "TODO: add support for cfg_scale=1"
+        assert len(chunk_schedule) > 0, "chunk_schedule must not be empty"
+        assert all(chunk_overlap < size for size in chunk_schedule), "overlap must be less than all chunk sizes"
+
+        batch_size = 1  # Streaming generation is single-sample only
         prefix_audio_len = 0 if audio_prefix_codes is None else audio_prefix_codes.shape[2]
         device = self.device
 
         # Use CUDA Graphs if supported, and torch.compile otherwise.
         cg = self.can_use_cudagraphs()
         decode_one_token = self._decode_one_token
-        disable = False
-        # decode_one_token = torch.compile(decode_one_token, dynamic=True, disable=cg or disable_torch_compile)
-        decode_one_token = torch.compile(decode_one_token, dynamic=True, disable=disable)
+        decode_one_token = torch.compile(decode_one_token, dynamic=True, disable=False)
 
         unknown_token = -1
         audio_seq_len = prefix_audio_len + max_new_tokens
@@ -514,6 +532,20 @@ class Zonos(nn.Module):
         step = 0
         # This variable will let us yield only the new audio since the last yield.
         prev_valid_length = 0
+        chunk_counter = 0
+
+        # For chunk scheduling
+        schedule_index = 0
+
+        # For audio processing
+        previous_audio = None
+        # Calculate window size based on overlap tokens (approx. samples per token)
+        samples_per_token = 512  # Approximate value based on DAC model
+        window_size = chunk_overlap * samples_per_token
+
+        # Create window functions (more efficient with torch operations)
+        fade_in = torch.linspace(0, 1, window_size, device=device)
+        fade_out = torch.linspace(1, 0, window_size, device=device)
 
         while torch.max(remaining_steps) > 0:
             offset += 1
@@ -542,21 +574,67 @@ class Zonos(nn.Module):
             inference_params.lengths_per_sample[:] += 1
             remaining_steps -= 1
             step += 1
+            chunk_counter += 1
 
             # --- Every 'chunk_size' tokens (or when finished), decode and yield the new audio ---
-            if (step % chunk_size == 0) or (torch.all(remaining_steps == 0)):
+            if (chunk_counter >= chunk_schedule[schedule_index]) or (torch.all(remaining_steps == 0)):
                 # In Zonos, the final output codes are produced by reverting the delay pattern.
                 # Only tokens up to (offset - 9) are valid.
 
                 full_codes = revert_delay_pattern(delayed_codes)
                 full_codes.masked_fill_(full_codes >= 1024, 0)
+
                 # Get the valid portion of the latent sequence.
                 valid_length = offset - 9
-                partial_codes = full_codes[..., prev_valid_length:valid_length]
 
+                # Include overlap with previous chunk for smoother transitions
+                # For the first chunk, there's no previous chunk to overlap with
+                start_idx = max(0, prev_valid_length - chunk_overlap)
+                partial_codes = full_codes[..., start_idx:valid_length]
+
+                # Decode the current chunk to audio (keep on device)
+                current_audio = self.autoencoder.decode(partial_codes)[0]
+
+                # Apply fade-in to the first chunk
+                if previous_audio is None and current_audio.shape[-1] > window_size:
+                    current_audio[..., :window_size] *= fade_in
+
+                # Apply windowing and overlap-add for smooth transitions
+                if (
+                    previous_audio is not None
+                    and current_audio.shape[-1] > window_size
+                    and previous_audio.shape[-1] > window_size
+                ):
+                    # Apply windowing to overlapping regions
+                    current_audio_start = current_audio[..., :window_size].clone()
+                    previous_audio_end = previous_audio[..., -window_size:].clone()
+
+                    # Crossfade the overlapping region
+                    current_audio[..., :window_size] = current_audio_start * fade_in + previous_audio_end * fade_out
+
+                    # Yield the previous audio up to the overlap point
+                    audio_to_yield = previous_audio[..., :-window_size]
+                else:
+                    # For the first chunk or if chunks are too small
+                    audio_to_yield = previous_audio if previous_audio is not None else None
+
+                # Store current audio for next iteration
+                previous_audio = current_audio
+
+                # Update for next chunk
                 prev_valid_length = valid_length
+                chunk_counter = 0
 
-                # Yield a tuple: (sampling_rate, audio_chunk) where audio_chunk is a numpy array.
-                yield (self.autoencoder.sampling_rate, partial_codes)
+                # Update chunk size according to schedule
+                if schedule_index < len(chunk_schedule) - 1:
+                    schedule_index += 1
+
+                # Yield the audio (skip first yield since we need to wait for the next chunk for overlap)
+                if audio_to_yield is not None:
+                    yield audio_to_yield
+
+        # Don't forget to yield the final audio chunk
+        if previous_audio is not None:
+            yield previous_audio
 
         self._cg_graph = None  # reset CUDA graph to avoid caching issues
