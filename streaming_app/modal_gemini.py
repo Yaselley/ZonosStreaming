@@ -3,13 +3,13 @@ import modal
 import torch
 import torchaudio
 from typing import Generator, Tuple
+import time
 
 # Define the Modal application
 app = modal.App("zonos-tts-app")
 
 # Define the Docker image with all necessary dependencies
-# This includes system packages and Python libraries.
-# The Zonos library is installed directly from its GitHub repository.
+# This version uses a more robust installation method for Zonos.
 zonos_image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install(
@@ -21,11 +21,19 @@ zonos_image = (
         "libsox-dev",
         "build-essential",
     )
+    # Install Python packages first
     .pip_install(
-        "git+https://github.com/Yaselley/ZonosStreaming.git",
         "gradio",
         "torchaudio",
         "numpy",
+        "transformers",
+    )
+    # Manually clone and install the ZonosStreaming repository
+    # This is more reliable than a direct pip git install.
+    .run_commands(
+        "cd /root && git clone https://github.com/Yaselley/ZonosStreaming.git",
+        "cd /root/ZonosStreaming && pip install -e .",
+        force_build=True, # Force a rebuild to ensure changes are applied
     )
 )
 
